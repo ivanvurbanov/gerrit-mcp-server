@@ -283,15 +283,12 @@ def _normalize_gerrit_url(url: str, gerrit_hosts: List[Dict[str, Any]]) -> str:
             matched_host = host
             break  # Found a match, so we can exit the loop.
 
-    # Ensure https, then strip trailing slash. Plain http:// is kept only for a
-    # loopback host (a local docker or test instance); everywhere else the
-    # credentials sent with each request must not travel in cleartext.
+    # Default a bare host to https, then strip trailing slash. An explicit
+    # http:// URL is preserved, never rewritten to https.
     if not (
         normalized_url.startswith("http://") or normalized_url.startswith("https://")
     ):
         normalized_url = "https://" + normalized_url
-    elif normalized_url.startswith("http://") and not _is_loopback_url(normalized_url):
-        normalized_url = normalized_url.replace("http://", "https://")
 
     normalized_url = normalized_url.rstrip("/")
 
@@ -795,13 +792,13 @@ def _review_post_succeeded(result_str: str) -> bool:
 
 def _find_comment_by_id(
     comments_by_file: Dict[str, List[Dict[str, Any]]], parent_comment_id: str
-) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Locates a comment by its Gerrit comment ID."""
+) -> Optional[str]:
+    """Returns the path of the file holding the given Gerrit comment ID."""
     for current_file_path, comments in comments_by_file.items():
         for comment in comments:
             if comment.get("id") == parent_comment_id:
-                return current_file_path, comment
-    return None, None
+                return current_file_path
+    return None
 
 
 @mcp.tool()
@@ -1893,7 +1890,7 @@ async def reply_to_comment(
             }
         ]
 
-    found_file_path, _ = _find_comment_by_id(comments_by_file, parent_comment_id)
+    found_file_path = _find_comment_by_id(comments_by_file, parent_comment_id)
     if found_file_path is None:
         return [
             {

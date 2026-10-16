@@ -43,7 +43,7 @@ class TestGerritConfig(unittest.TestCase):
         )
 
     @patch("gerrit_mcp_server.main.load_gerrit_config")
-    def test_normalize_gerrit_url_keeps_http_for_loopback_hosts(self, mock_load_config):
+    def test_normalize_gerrit_url_keeps_explicit_http(self, mock_load_config):
         mock_load_config.return_value = {
             "gerrit_hosts": [
                 {
@@ -70,10 +70,10 @@ class TestGerritConfig(unittest.TestCase):
             "http://0.0.0.0:8080",
         ):
             self.assertEqual(_normalize_gerrit_url(url, gerrit_hosts), url)
-        # A non-loopback http:// host is still rewritten to https.
+        # An explicit http:// host is preserved even when not loopback.
         self.assertEqual(
             _normalize_gerrit_url("http://other.example.com/", gerrit_hosts),
-            "https://other.example.com",
+            "http://other.example.com",
         )
         # A bare host still defaults to https.
         self.assertEqual(

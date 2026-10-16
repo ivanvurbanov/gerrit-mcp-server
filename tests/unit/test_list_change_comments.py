@@ -124,6 +124,45 @@ class TestListChangeComments(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
+    def test_list_change_comments_multilingual(self, mock_run_curl):
+        async def run_test():
+            # Arrange
+            mock_run_curl.return_value = json.dumps(
+                {
+                    "file1.txt": [
+                        {
+                            "id": "c1",
+                            "line": 8,
+                            "author": {"name": "user1@example.com"},
+                            "message": "Коментар на кирилица",
+                            "unresolved": True,
+                            "updated": "2025-07-15T11:00:00Z",
+                        },
+                        {
+                            "id": "c2",
+                            "line": 9,
+                            "author": {"name": "user2@example.com"},
+                            "message": "修正済みのコメント",
+                            "unresolved": False,
+                            "updated": "2025-07-15T11:05:00Z",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+            # Act
+            result = await main.list_change_comments(
+                "123", gerrit_base_url="https://my-gerrit.com"
+            )
+
+            # Assert
+            self.assertIn("Коментар на кирилица", result[0]["text"])
+            self.assertIn("修正済みのコメント", result[0]["text"])
+
+        asyncio.run(run_test())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,30 +3,31 @@
 Here are a few examples of how you can use the Gerrit MCP Server with a language
 model:
 
-| Category             | Natural Language Query                                                                          | Corresponding Tool(s)               |
-| :------------------- | :---------------------------------------------------------------------------------------------- | :---------------------------------- |
-| **Find recent work** | "Show me the last 5 CLs I submitted."                                                           | `query_changes`                     |
-|                      | "What are the open CLs for the 'main' branch in the 'my-project' project?"                      | `query_changes`                     |
-|                      | "Find CLs merged between 2025-09-01 and 2025-09-05 containing 'bug fix'."                       | `query_changes_by_date_and_filters` |
-| **Get CL details**   | "What are the details for CL 12345?"                                                            | `get_change_details`                |
-|                      | "Who are the reviewers on CL 67890?"                                                            | `get_change_details`                |
-|                      | "Get the commit message for change 54321."                                                      | `get_commit_message`                |
-|                      | "List the files changed in CL 12345."                                                           | `list_change_files`                 |
-|                      | "Show me the diff for 'src/main.py' in CL 12345."                                               | `get_file_diff`                     |
-|                      | "What bugs are linked to CL 12345?"                                                             | `get_bugs_from_cl`                  |
-| **Manage Reviews**   | "Add user@example.com as a reviewer to CL 12345."                                               | `add_reviewer`                      |
-|                      | "Set CL 12345 to ready for review."                                                             | `set_ready_for_review`              |
-|                      | "Mark CL 67890 as work in progress."                                                            | `set_work_in_progress`              |
-|                      | "Abandon CL 54321."                                                                             | `abandon_change`                    |
-|                      | "Suggest reviewers for CL 12345 who know about the 'auth' module."                              | `suggest_reviewers`                 |
-| **Review Helper**    | "List the comments on CL 12345."                                                                | `list_change_comments`              |
-|                      | "Post a comment on CL 12345, file 'utils.py', line 20: 'Add a test for this case.'"             | `post_review_comment`               |
-| **Advanced**         | "Revert CL 12345 with the message 'Broke the build'."                                           | `revert_change`                     |
-|                      | "What other changes would be submitted with CL 67890?"                                          | `changes_submitted_together`        |
-|                      | "Show me the relation chain for CL 67890 — are its ancestors merged?"                           | `get_related_changes`               |
-|                      | "Get the parent commit SHAs for CL 67890."                                                      | `get_revision_commit`               |
-|                      | "Which open changes are immediate git-parents of CL 67890?"                                     | `get_git_parent_changes`            |
-|                      | "Create a new change in project 'test-project', branch 'dev', with subject 'Test new feature'." | `create_change`                     |
+| Category             | Natural Language Query                                                                                    | Corresponding Tool(s)               |
+| :------------------- | :-------------------------------------------------------------------------------------------------------- | :---------------------------------- |
+| **Find recent work** | "Show me the last 5 CLs I submitted."                                                                     | `query_changes`                     |
+|                      | "What are the open CLs for the 'main' branch in the 'my-project' project?"                                | `query_changes`                     |
+|                      | "Find CLs merged between 2025-09-01 and 2025-09-05 containing 'bug fix'."                                 | `query_changes_by_date_and_filters` |
+| **Get CL details**   | "What are the details for CL 12345?"                                                                      | `get_change_details`                |
+|                      | "Who are the reviewers on CL 67890?"                                                                      | `get_change_details`                |
+|                      | "Get the commit message for change 54321."                                                                | `get_commit_message`                |
+|                      | "List the files changed in CL 12345."                                                                     | `list_change_files`                 |
+|                      | "Show me the diff for 'src/main.py' in CL 12345."                                                         | `get_file_diff`                     |
+|                      | "What bugs are linked to CL 12345?"                                                                       | `get_bugs_from_cl`                  |
+| **Manage Reviews**   | "Add user@example.com as a reviewer to CL 12345."                                                         | `add_reviewer`                      |
+|                      | "Set CL 12345 to ready for review."                                                                       | `set_ready_for_review`              |
+|                      | "Mark CL 67890 as work in progress."                                                                      | `set_work_in_progress`              |
+|                      | "Abandon CL 54321."                                                                                       | `abandon_change`                    |
+|                      | "Suggest reviewers for CL 12345 who know about the 'auth' module."                                        | `suggest_reviewers`                 |
+| **Review Helper**    | "List the comments on CL 12345."                                                                          | `list_change_comments`              |
+|                      | "Post a comment on CL 12345, file 'utils.py', line 20: 'Add a test for this case.'"                       | `post_review_comment`               |
+|                      | "Reply to comment 'TvcXrmjM' on CL 12345 in file 'utils.py': 'I added the test in the latest patch set.'" | `reply_to_comment`                  |
+| **Advanced**         | "Revert CL 12345 with the message 'Broke the build'."                                                     | `revert_change`                     |
+|                      | "What other changes would be submitted with CL 67890?"                                                    | `changes_submitted_together`        |
+|                      | "Show me the relation chain for CL 67890 — are its ancestors merged?"                                     | `get_related_changes`               |
+|                      | "Get the parent commit SHAs for CL 67890."                                                                | `get_revision_commit`               |
+|                      | "Which open changes are immediate git-parents of CL 67890?"                                               | `get_git_parent_changes`            |
+|                      | "Create a new change in project 'test-project', branch 'dev', with subject 'Test new feature'."           | `create_change`                     |
 
 ## Data Analysis Use Cases
 

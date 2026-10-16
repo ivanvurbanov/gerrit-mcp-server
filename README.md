@@ -8,6 +8,26 @@ Gerrit REST API.
 This server can be run as a persistent **HTTP server** or on-demand via
 **STDIO**.
 
+## Upstream
+
+This repository is a clone of
+`https://gerrit.googlesource.com/gerrit-mcp-server/`.
+
+Differences from upstream:
+
+- HTTP Basic auth accepts `user`/`username` and `password`/`auth_token` aliases,
+  with updated docs and sample config.
+- The MCP server is initialized with `json_response=True` to support non-SSE
+  HTTP clients.
+- Gerrit URL normalization preserves explicit `http://` URLs instead of forcing
+  HTTPS.
+- `server.sh` binds to `127.0.0.1` instead of `localhost`.
+- A `reply_to_comment` tool posts a reply to an existing published comment.
+- Stdio, log and config file handling use UTF-8, so non-ASCII comments work on
+  Windows.
+- Windows `build-gerrit.bat` and `server.bat` scripts mirror their `.sh`
+  counterparts.
+
 ## 📚 Documentation
 
 For detailed information, please see the documents in the `docs/` directory:
