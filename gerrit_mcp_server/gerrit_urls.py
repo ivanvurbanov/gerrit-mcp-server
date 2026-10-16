@@ -17,16 +17,17 @@ This module is responsible for determining the correct curl command for a given
 Gerrit URL by dispatching to the appropriate authentication module.
 """
 
-from typing import List, Dict, Any
+from typing import Any, Dict
+
 from gerrit_mcp_server import gerrit_auth
 
 
 def get_curl_command_for_gerrit_url(
     gerrit_base_url: str, config: Dict[str, Any]
-) -> List[str]:
+) -> gerrit_auth.CurlAuth:
     """
     Determines the appropriate curl command based on the authentication settings
-    for the given Gerrit host.
+    for the given Gerrit host, together with the credentials that command carries.
     """
     gerrit_hosts = config.get("gerrit_hosts", [])
     auth_config = None
@@ -34,6 +35,10 @@ def get_curl_command_for_gerrit_url(
     stripped_gerrit_base_url = (
         gerrit_base_url.replace("https://", "").replace("http://", "").rstrip("/")
     )
+    # Strip /a suffix that may have been added by _normalize_gerrit_url
+    # for authenticated access, so we can match against configured host URLs.
+    if stripped_gerrit_base_url.endswith("/a"):
+        stripped_gerrit_base_url = stripped_gerrit_base_url[:-2]
 
     for host in gerrit_hosts:
         internal_url = (
@@ -74,44 +79,6 @@ def get_curl_command_for_gerrit_url(
 
     raise ValueError(
         "No valid authentication method found in gerrit_config.json. "
-        "Please configure a supported 'type' (e.g., 'http_basic', 'gob_curl', 'git_cookies') for the relevant host."
+        "Please configure a supported 'type' (e.g., 'http_basic', 'gob_curl', "
+        "'git_cookies') for the relevant host."
     )
-
-
-def requires_authenticated_prefix(
-    gerrit_base_url: str, config: Dict[str, Any]
-) -> bool:
-    """
-    Returns True if the Gerrit host uses an authentication type that requires
-    the /a/ prefix on REST API endpoints (e.g. http_basic).
-
-    Gerrit's REST API requires authenticated endpoints to be accessed via
-    /a/changes/... (rather than /changes/...) when using HTTP basic auth.
-    """
-    gerrit_hosts = config.get("gerrit_hosts", [])
-
-    stripped_gerrit_base_url = (
-        gerrit_base_url.replace("https://", "").replace("http://", "").rstrip("/")
-    )
-
-    for host in gerrit_hosts:
-        internal_url = (
-            host.get("internal_url", "")
-            .replace("https://", "")
-            .replace("http://", "")
-            .rstrip("/")
-        )
-        external_url = (
-            host.get("external_url", "")
-            .replace("https://", "")
-            .replace("http://", "")
-            .rstrip("/")
-        )
-        if (
-            stripped_gerrit_base_url == internal_url
-            or stripped_gerrit_base_url == external_url
-        ):
-            auth_config = host.get("authentication", {})
-            return auth_config.get("type") == "http_basic"
-
-    return False

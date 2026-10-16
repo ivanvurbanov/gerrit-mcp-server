@@ -12,22 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
-import json
-import sys
-import base64
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
-import os
-import datetime  # Added this import
 import argparse
+import asyncio
+import base64
+import datetime
+import io
+import ipaddress
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, TypedDict
+from urllib.parse import quote, urlparse
 
-from gerrit_mcp_server.gerrit_urls import get_curl_command_for_gerrit_url, requires_authenticated_prefix
+from mcp.server.fastmcp import Context, FastMCP
+
 from gerrit_mcp_server.bug_utils import extract_bugs_from_commit_message
+from gerrit_mcp_server.extensions import ExtensionContext, ExtensionLoader
+from gerrit_mcp_server.gerrit_urls import get_curl_command_for_gerrit_url
+from gerrit_mcp_server.http_headers import (
+    RequestObservabilityContext,
+    _request_obs,
+    build_curl_header_args,
+)
+from gerrit_mcp_server.plugin_registry import PluginRegistry
 from gerrit_mcp_server.sort_util import sort_changes_by_date
-from mcp.server.fastmcp import FastMCP
-import mcp.types as types
 
 
 def _configure_text_stream_encoding(stream: Any) -> None:
@@ -44,7 +53,6 @@ def _configure_stdio_encoding() -> None:
 
 
 _configure_stdio_encoding()
-
 
 # --- Load Gerrit details from JSON ---
 # Define paths outside the try block to ensure they are always initialized.
@@ -81,56 +89,130 @@ def load_gerrit_config() -> Dict[str, Any]:
             config = json.load(f)
             default_url = config.get("default_gerrit_base_url")
             if default_url:
-                normalized_default = _normalize_gerrit_url(default_url, config.get("gerrit_hosts", []))
+                normalized_default = _normalize_gerrit_url(
+                    default_url, config.get("gerrit_hosts", [])
+                )
                 found_match = False
                 for host in config.get("gerrit_hosts", []):
                     external_url = host.get("external_url")
                     internal_url = host.get("internal_url")
-                    if external_url and _normalize_gerrit_url(external_url, config.get("gerrit_hosts", [])) == normalized_default:
+                    if (
+                        external_url
+                        and _normalize_gerrit_url(
+                            external_url, config.get("gerrit_hosts", [])
+                        )
+                        == normalized_default
+                    ):
                         found_match = True
                         break
-                    if internal_url and _normalize_gerrit_url(internal_url, config.get("gerrit_hosts", [])) == normalized_default:
+                    if (
+                        internal_url
+                        and _normalize_gerrit_url(
+                            internal_url, config.get("gerrit_hosts", [])
+                        )
+                        == normalized_default
+                    ):
                         found_match = True
                         break
                 if not found_match:
                     raise ValueError(
-                        f"The default_gerrit_base_url '{default_url}' (normalized to '{normalized_default}') "
-                        "does not match any 'external_url' or 'internal_url' in the 'gerrit_hosts' array. "
+                        f"The default_gerrit_base_url '{default_url}' "
+                        f"(normalized to '{normalized_default}') "
+                        "does not match any 'external_url' or 'internal_url' "
+                        "in the 'gerrit_hosts' array. "
                         f"Please check your configuration file at {config_path}."
                     )
             return config
     except json.JSONDecodeError as e:
         print(
-            f"[gerrit-mcp-server-error] Could not parse {config_path}: {e}. Please check the file for syntax errors.",
+            f"[gerrit-mcp-server-error] Could not parse {config_path}: {e}. "
+            "Please check the file for syntax errors.",
             file=sys.stderr,
         )
         raise e
+
+
+def _exit_on_config_error(load: Callable[[], Any]) -> Any:
+    """Run ``load()``; on a config error print it and exit (missing=1, invalid=2)."""
+    try:
+        return load()
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+
+def check_config_main() -> None:
+    _exit_on_config_error(load_gerrit_config)
 
 
 try:
     with open(PKG_PATH / "gerrit_details.json", "r", encoding=TEXT_FILE_ENCODING) as f:
         gerrit_details = json.load(f)
     # This file is not used in this implementation, but kept for pattern consistency
-    with open(PKG_PATH / "gerrit_command_argument_defs.json", "r", encoding=TEXT_FILE_ENCODING) as f:
+    with open(
+        PKG_PATH / "gerrit_command_argument_defs.json", "r", encoding=TEXT_FILE_ENCODING
+    ) as f:
         gerrit_arg_defs = json.load(f)
 except Exception as e:
     print(
-        f"[gerrit-mcp-server-error] Failed to load or parse JSON files: {e}. Using default descriptions.",
+        f"[gerrit-mcp-server-error] Failed to load or parse JSON files: {e}. "
+        "Using default descriptions.",
         file=sys.stderr,
     )
     gerrit_details = {
-        "toolOverallDescription": "A tool to interact with Gerrit code review systems using curl."
+        "toolOverallDescription": (
+            "A tool to interact with Gerrit code review systems using curl."
+        )
     }
 
 # --- Initialize FastMCP Server ---
+
+
+class GerritFastMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict) -> Any:
+        ctx = self.get_context()
+        obs = _obs_from_context(ctx, name)
+        token = _request_obs.set(obs)
+        try:
+            return await super().call_tool(name, arguments)
+        finally:
+            _request_obs.reset(token)
+
+
+def _obs_from_context(ctx: Context, tool_name: str) -> RequestObservabilityContext:
+    client_name = None
+    client_version = None
+    protocol_version = None
+    try:
+        params = ctx.session.client_params
+        if params is not None:
+            info = params.clientInfo
+            client_name = getattr(info, "name", None) or None
+            client_version = getattr(info, "version", None) or None
+            pv = params.protocolVersion
+            protocol_version = str(pv) if pv else None
+    except Exception:
+        pass
+    return RequestObservabilityContext(
+        tool_name=tool_name,
+        client_name=client_name,
+        client_version=client_version,
+        protocol_version=protocol_version,
+    )
+
+
 # Use JSON responses to avoid SSE-only clients failing Accept header checks.
-mcp = FastMCP("gerrit", json_response=True)
+mcp = GerritFastMCP("gerrit", json_response=True)
 
 # --- Session State ---
 
 
 def _get_gerrit_base_url(gerrit_base_url: Optional[str] = None) -> str:
-    """Returns the Gerrit base URL, prioritizing the parameter over the environment variable."""
+    """Returns the Gerrit base URL, prioritizing the parameter
+    over the environment variable."""
     if gerrit_base_url:
         return gerrit_base_url
 
@@ -143,6 +225,27 @@ def _get_gerrit_base_url(gerrit_base_url: Optional[str] = None) -> str:
     )
 
 
+def _apply_authenticated_prefix(url: str, host: Dict[str, Any]) -> str:
+    """Appends /a to the URL if the host's auth type requires it for API access."""
+    auth_type = host.get("authentication", {}).get("type")
+
+    if auth_type in ("http_basic", "git_cookies"):
+        return url + "/a"
+
+    return url
+
+
+def _is_loopback_url(url: str) -> bool:
+    """True when the URL host is loopback (localhost, 127.0.0.0/8, ::1, 0.0.0.0)."""
+    host = urlparse(url).hostname or ""
+    if host in ("localhost", "0.0.0.0"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.endswith(".localhost")
+
+
 def _normalize_gerrit_url(url: str, gerrit_hosts: List[Dict[str, Any]]) -> str:
     """Normalizes a Gerrit URL based on the mappings in the provided gerrit_hosts."""
 
@@ -151,6 +254,7 @@ def _normalize_gerrit_url(url: str, gerrit_hosts: List[Dict[str, Any]]) -> str:
     stripped_original_url = original_url.replace("https://", "").replace("http://", "")
 
     normalized_url = url  # Default to original if no match found
+    matched_host = None
 
     for host in gerrit_hosts:
         internal_url = host.get("internal_url")
@@ -176,35 +280,36 @@ def _normalize_gerrit_url(url: str, gerrit_hosts: List[Dict[str, Any]]) -> str:
                 normalized_url = external_url
             elif internal_url:
                 normalized_url = internal_url
+            matched_host = host
             break  # Found a match, so we can exit the loop.
 
-    # Ensure a scheme, then strip trailing slash.
+    # Ensure https, then strip trailing slash. Plain http:// is kept only for a
+    # loopback host (a local docker or test instance); everywhere else the
+    # credentials sent with each request must not travel in cleartext.
     if not (
         normalized_url.startswith("http://") or normalized_url.startswith("https://")
     ):
         normalized_url = "https://" + normalized_url
+    elif normalized_url.startswith("http://") and not _is_loopback_url(normalized_url):
+        normalized_url = normalized_url.replace("http://", "https://")
 
-    return normalized_url.rstrip("/")
+    normalized_url = normalized_url.rstrip("/")
 
+    if matched_host:
+        return _apply_authenticated_prefix(normalized_url, matched_host)
 
-def _build_gerrit_api_url(base_url: str, path: str, config: Dict[str, Any]) -> str:
-    """Builds a Gerrit REST API URL, inserting /a/ prefix when required by auth type.
-
-    Gerrit requires authenticated endpoints to use /a/... when using HTTP
-    basic auth. This helper transparently adds the prefix when the host is
-    configured with http_basic authentication.
-    """
-    if requires_authenticated_prefix(base_url, config):
-        return f"{base_url}/a/{path.lstrip('/')}"
-    return f"{base_url}/{path.lstrip('/')}"
+    return normalized_url
 
 
 async def run_curl(args: List[str], gerrit_base_url: str) -> str:
     """Executes a curl command and returns the output."""
     config = load_gerrit_config()
-    command = get_curl_command_for_gerrit_url(gerrit_base_url, config) + args
+    obs_headers = build_curl_header_args(_request_obs.get())
+    auth = get_curl_command_for_gerrit_url(gerrit_base_url, config)
+    command = auth.argv + obs_headers + args
+    logged_command = " ".join(auth.redacted_argv + obs_headers + args)
     with _open_log_file() as log_file:
-        log_file.write(f"[gerrit-mcp-server] Executing: {" ".join(command)}\n")
+        log_file.write(f"[gerrit-mcp-server] Executing: {logged_command}\n")
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -222,7 +327,10 @@ async def run_curl(args: List[str], gerrit_base_url: str) -> str:
         log_file.write(f"[gerrit-mcp-server] stderr:\n{stderr_str}\n")
 
     if process.returncode != 0:
-        error_msg = f"curl command failed with exit code {process.returncode}.\nSTDERR:\n{stderr_str}"
+        error_msg = (
+            f"curl command failed with exit code {process.returncode}.\n"
+            f"STDERR:\n{stderr_str}"
+        )
         with _open_log_file() as log_file:
             log_file.write(f"[gerrit-mcp-server] {error_msg}\n")
         raise Exception(error_msg)
@@ -258,6 +366,11 @@ def _create_put_args(url: str, payload: Optional[Dict[str, Any]] = None) -> List
     return args
 
 
+def _create_delete_args(url: str) -> List[str]:
+    """Creates the argument list for a curl DELETE request."""
+    return ["-X", "DELETE", url]
+
+
 # --- Tool Implementations ---
 
 
@@ -273,8 +386,10 @@ async def query_changes(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/?q={quote(query)}", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/?q={quote(query)}"
     if limit:
         url += f"&n={limit}"
     if options:
@@ -288,7 +403,10 @@ async def query_changes(
         return [
             {
                 "type": "text",
-                "text": f"Failed to parse JSON response from Gerrit. Raw response: '{result_json_str}'",
+                "text": (
+                    f"Failed to parse JSON response from Gerrit. "
+                    f"Raw response: '{result_json_str}'"
+                ),
             }
         ]
     changes = sort_changes_by_date(changes)
@@ -299,7 +417,7 @@ async def query_changes(
     output = f'Found {len(changes)} changes for query "{query}":\n'
     for change in changes:
         wip_prefix = "[WIP] " if change.get("work_in_progress") else ""
-        output += f"- {change["_number"]}: {wip_prefix}{change["subject"]}\n"
+        output += f"- {change['_number']}: {wip_prefix}{change['subject']}\n"
 
     return [{"type": "text", "text": output}]
 
@@ -315,8 +433,9 @@ async def query_changes_by_date_and_filters(  # Renamed method
     status: str = "merged",
 ):
     """
-    Searches for Gerrit changes within a specified date range, optionally filtered by project,
-    a substring in the commit message, and change status. This tool provides a flexible way
+    Searches for Gerrit changes within a specified date range, optionally
+    filtered by project, a substring in the commit message, and change
+    status. This tool provides a flexible way
     to find changes based on their dates and content.
 
     Args:
@@ -324,9 +443,12 @@ async def query_changes_by_date_and_filters(  # Renamed method
         end_date: The end date for the changes (e.g., "2025-08-19").
         gerrit_base_url: The base URL of the Gerrit instance.
         limit: The maximum number of changes to return.
-        project: Optional project name to filter by. This filter is only applied if `gerrit_base_url` is not explicitly provided, in which case the default Gerrit instance will be queried.
+        project: Optional project name to filter by. This filter is only
+            applied if `gerrit_base_url` is not explicitly provided, in which
+            case the default Gerrit instance will be queried.
         message_substring: An optional substring to search for in the commit message.
-        status: The status of the changes to search for (e.g., "merged", "open", "abandoned"). Defaults to "merged".
+        status: The status of the changes to search for (e.g., "merged",
+            "open", "abandoned"). Defaults to "merged".
     """
     # Parse dates and increment end_date by one day for Gerrit's 'before' operator
     try:
@@ -336,11 +458,15 @@ async def query_changes_by_date_and_filters(  # Renamed method
         return [
             {
                 "type": "text",
-                "text": "Invalid date format. Please use YYYY-MM-DD for start_date and end_date.",
+                "text": (
+                    "Invalid date format. Please use YYYY-MM-DD "
+                    "for start_date and end_date."
+                ),
             }
         ]
 
-    # Increment the end date by one day to make the 'before' query inclusive of the target end_date
+    # Increment the end date by one day to make the 'before' query
+    # inclusive of the target end_date
     effective_end_date = parsed_end_date + datetime.timedelta(days=1)
     effective_end_date_str = effective_end_date.strftime("%Y-%m-%d")
 
@@ -369,13 +495,21 @@ async def get_change_details(
     change_id: str,
     gerrit_base_url: Optional[str] = None,
     options: Optional[List[str]] = None,
+    full_messages: bool = False,
 ):
     """
     Retrieves a comprehensive summary of a single CL.
+
+    By default the summary ends with the first line of the three latest
+    messages. Pass full_messages=True to get every message in full, e.g. to
+    read what a CI bot wrote after its vote: the build result and the link
+    to the build.
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
 
     # Always get the commit message and other details
     base_options = ["CURRENT_REVISION", "CURRENT_COMMIT", "DETAILED_LABELS"]
@@ -386,7 +520,7 @@ async def get_change_details(
         options = base_options
 
     query_params = "&".join([f"o={option}" for option in options])
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/detail?{query_params}", config)
+    url = f"{base_url}/changes/{change_id}/detail?{query_params}"
 
     result_json_str = await run_curl([url], base_url)
     details = json.loads(result_json_str)
@@ -401,11 +535,22 @@ async def get_change_details(
         "revisions", {}
     ):
         current_rev_info = details["revisions"][details["current_revision"]]
+        output += (
+            f"Current patch set: {current_rev_info['_number']} "
+            f"(commit {details['current_revision']}, ref {current_rev_info['ref']})\n"
+        )
         if "commit" in current_rev_info and "message" in current_rev_info["commit"]:
             commit_message = current_rev_info["commit"]["message"]
             bugs = extract_bugs_from_commit_message(commit_message)
             if bugs:
                 output += f"Bugs: {', '.join(sorted(list(bugs)))}\n"
+
+    if len(details.get("revisions", {})) > 1:
+        output += "Patch sets:\n"
+        for commit_sha, revision_info in sorted(
+            details["revisions"].items(), key=lambda item: item[1]["_number"]
+        ):
+            output += f"- {revision_info['_number']}: {commit_sha}\n"
 
     if "reviewers" in details and "REVIEWER" in details["reviewers"]:
         output += "Reviewers:\n"
@@ -424,83 +569,89 @@ async def get_change_details(
             output += f"- {reviewer_email} ({', '.join(votes)})\n"
 
     if "messages" in details and details["messages"]:
-        output += "Recent Messages:\n"
-        for msg in details["messages"][-3:]:
+        messages = details["messages"] if full_messages else details["messages"][-3:]
+        output += "Messages:\n" if full_messages else "Recent Messages:\n"
+        for msg in messages:
             author = msg.get("author", {}).get("name", "Gerrit")
             timestamp = msg.get("date", "No date")
-            message_summary = msg["message"].splitlines()[0]
-            output += f"- (Patch Set {msg['_revision_number']}) [{timestamp}] ({author}): {message_summary}\n"
+            header = (
+                f"- (Patch Set {msg['_revision_number']}) [{timestamp}] ({author}):"
+            )
+            if full_messages:
+                body = "".join(
+                    f"    {line}\n" if line else "\n"
+                    for line in msg["message"].splitlines()
+                )
+                output += f"{header}\n{body}"
+            else:
+                message_summary = msg["message"].splitlines()[0]
+                output += f"{header} {message_summary}\n"
 
     return [{"type": "text", "text": output}]
+
+
+class _CommitMessageResult(TypedDict):
+    change_id: str
+    verbatim_commit_message: str
 
 
 @mcp.tool()
 async def get_commit_message(
     change_id: str,
     gerrit_base_url: Optional[str] = None,
-):
+) -> _CommitMessageResult:
     """
-    Gets the commit message of a change from the current patch set.
+    Gets the verbatim commit message of a change from the current patch set.
+
+    IMPORTANT: The commit message returned in the verbatim_commit_message field
+    MUST be used exactly as-is, without paraphrasing, reformatting, or
+    summarizing any part of it. Do not alter the subject line, body, or footers
+    (e.g. Change-Id, Bug:, Reviewed-by:).
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/message", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/message"
 
     try:
         result_str = await run_curl([url], base_url)
         commit_info = json.loads(result_str)
-
-        output = f"Commit message for CL {change_id}:\n"
-        output += f"Subject: {commit_info.get('subject', 'N/A')}\n\n"
-        output += "Full Message:\n"
-        output += "--------------------------------------------------------\n"
-        output += f"{commit_info.get('full_message', 'Message not found.')}\n"
-        output += "--------------------------------------------------------\n"
-
-        if "footers" in commit_info and commit_info["footers"]:
-            output += "\nFooters:\n"
-            for key, value in commit_info["footers"].items():
-                output += f"- {key}: {value}\n"
-
-        return [{"type": "text", "text": output}]
-
-    except json.JSONDecodeError:
-        return [
-            {
-                "type": "text",
-                "text": f"Failed to get commit message for CL {change_id}. Invalid JSON response.",
-            }
-        ]
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Failed to parse JSON response from Gerrit for CL {change_id}."
+            f" Raw response: '{result_str}'"
+        ) from e
     except Exception as e:
-        with _open_log_file() as log_file:
-            log_file.write(
-                f"[gerrit-mcp-server] Error getting commit message for CL {change_id}: {e}\n"
-            )
-        return [
-            {
-                "type": "text",
-                "text": f"An error occurred while getting the commit message for CL {change_id}: {e}",
-            }
-        ]
+        raise RuntimeError(
+            f"Error getting commit message for CL {change_id}: {e}"
+        ) from e
+
+    return {
+        "change_id": change_id,
+        "verbatim_commit_message": commit_info.get(
+            "full_message", "Message not found."
+        ),
+    }
 
 
 @mcp.tool()
-async def list_change_files(
-    change_id: str, gerrit_base_url: Optional[str] = None
-):
+async def list_change_files(change_id: str, gerrit_base_url: Optional[str] = None):
     """
     Lists all files modified in the most recent patch set of a CL.
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revisions/current/files/", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revisions/current/files/"
     result_json_str = await run_curl([url], base_url)
     files = json.loads(result_json_str)
 
     # We need the revision number for the patch set
-    detail_url = _build_gerrit_api_url(base_url, f"changes/{change_id}/detail", config)
+    detail_url = f"{base_url}/changes/{change_id}/detail"
     detail_json_str = await run_curl([detail_url], base_url)
     details = json.loads(detail_json_str)
     patch_set = details.get("current_revision_number", "current")
@@ -527,23 +678,110 @@ async def get_file_diff(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
     encoded_file_path = quote(file_path, safe="")
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revisions/current/patch?path={encoded_file_path}", config)
+    url = (
+        f"{base_url}/changes/{change_id}/revisions/current/patch"
+        f"?path={encoded_file_path}"
+    )
 
     diff_base64 = await run_curl([url], base_url)
     # The response is a base64 encoded string, we need to decode it.
-    # The result from run_curl is already a string, so we encode it back to bytes for b64decode
+    # The result from run_curl is already a string, so we encode it back
+    # to bytes for b64decode
     diff_text = base64.b64decode(diff_base64.encode("utf-8")).decode("utf-8")
     return [{"type": "text", "text": diff_text}]
 
 
-async def _fetch_change_comments_json(
-    change_id: str, base_url: str, config: Dict[str, Any]
-) -> str:
+class _FileContentResult(TypedDict):
+    change_id: str
+    file_path: str
+    revision: str
+    first_line: Optional[int]
+    last_line: Optional[int]
+    line_count: int
+    content: str
+
+
+@mcp.tool()
+async def get_file_content(
+    change_id: str,
+    file_path: str,
+    revision_id: Optional[str] = None,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    gerrit_base_url: Optional[str] = None,
+) -> _FileContentResult:
+    """
+    Returns the content of a file as it is in a revision of a CL.
+
+    Use it to read a whole file rather than its diff, e.g. a large fixture.
+    revision_id defaults to "current" (the latest patch set). Pass a
+    patch-set number or commit SHA to read an older revision.
+
+    The whole file is returned untruncated, so a large file uses a large
+    share of the context. To read only some lines, pass start_line,
+    end_line, or both (1-based, inclusive). If only the changed lines
+    matter, use get_file_diff instead.
+
+    first_line and last_line number the lines content holds (None for an
+    empty file), and line_count counts the lines of the whole file. Raises
+    ValueError when the file cannot be fetched, is not UTF-8 text, or has
+    no line in the requested range.
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    revision = revision_id or "current"
+    encoded_file_path = quote(file_path, safe="")
+    url = (
+        f"{base_url}/changes/{change_id}/revisions/{revision}/files/"
+        f"{encoded_file_path}/content"
+    )
+
+    result_str = await run_curl([url], base_url)
+    try:
+        content = base64.b64decode(result_str, validate=True)
+    except ValueError as e:
+        raise ValueError(f"Failed to fetch {file_path}.\n{result_str}") from e
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"{file_path} is not UTF-8 text ({len(content)} bytes)."
+        ) from e
+
+    # Only "\n" ends a line, as in Gerrit. str.splitlines() would also
+    # split on form feeds and other separators and shift the numbers.
+    lines = io.StringIO(text, newline="\n").readlines()
+    first = 1 if start_line is None else start_line
+    last = len(lines) if end_line is None else min(end_line, len(lines))
+    range_given = start_line is not None or end_line is not None
+    if range_given and (first < 1 or first > last):
+        raise ValueError(
+            f"start_line={start_line}, end_line={end_line} selects "
+            f"no lines of {file_path} (line count: {len(lines)})."
+        )
+    selected = lines[first - 1 : last]
+    return {
+        "change_id": change_id,
+        "file_path": file_path,
+        "revision": revision,
+        "first_line": first if selected else None,
+        "last_line": last if selected else None,
+        "line_count": len(lines),
+        "content": "".join(selected),
+    }
+
+
+async def _fetch_change_comments_json(change_id: str, base_url: str) -> str:
     """Fetches the raw published comments JSON for a change."""
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/comments", config)
-    return await run_curl([url], base_url)
+    return await run_curl([f"{base_url}/changes/{change_id}/comments"], base_url)
 
 
 def _review_post_succeeded(result_str: str) -> bool:
@@ -567,23 +805,27 @@ def _find_comment_by_id(
 
 
 @mcp.tool()
-async def list_change_comments(
-    change_id: str, gerrit_base_url: Optional[str] = None
-):
+async def list_change_comments(change_id: str, gerrit_base_url: Optional[str] = None):
     """
-    list_change_comments is useful for reviewing feedback, reading comments on a change, analyzing comments, and responding to comments.
+    list_change_comments is useful for reviewing feedback, reading comments
+    on a change, analyzing comments, and responding to comments.
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    result_json_str = await _fetch_change_comments_json(change_id, base_url, config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    result_json_str = await _fetch_change_comments_json(change_id, base_url)
     try:
         comments_by_file = json.loads(result_json_str)
     except json.JSONDecodeError:
         return [
             {
                 "type": "text",
-                "text": f"Failed to parse JSON response from Gerrit. Raw response:\n{result_json_str}",
+                "text": (
+                    "Failed to parse JSON response from Gerrit. "
+                    f"Raw response:\n{result_json_str}"
+                ),
             }
         ]
 
@@ -598,11 +840,13 @@ async def list_change_comments(
             timestamp = comment.get("updated", "No date")
             message = comment["message"]
             status = "UNRESOLVED" if comment.get("unresolved", False) else "RESOLVED"
-            comment_id = comment.get("id", "UNKNOWN")
-            reply_bits = [f"comment_id={comment_id}"]
-            if comment.get("in_reply_to"):
-                reply_bits.append(f"in_reply_to={comment['in_reply_to']}")
-            output += f"L{line}: [{author}] ({timestamp}) - {status} {' '.join(reply_bits)}\n"
+            comment_id = comment.get("id", "")
+            reply_to = comment.get("in_reply_to")
+            reply_suffix = f" in_reply_to={reply_to}" if reply_to else ""
+            output += (
+                f"L{line}: [{author}] ({timestamp}) - {status} "
+                f"id={comment_id}{reply_suffix}\n"
+            )
             output += f"  {message}\n"
 
     if not found_comments:
@@ -625,14 +869,19 @@ async def add_reviewer(
         return [
             {
                 "type": "text",
-                "text": f"Failed to add {reviewer}: Invalid state '{state}'. State must be either 'REVIEWER' or 'CC'.",
+                "text": (
+                    f"Failed to add {reviewer}: Invalid state '{state}'. "
+                    "State must be either 'REVIEWER' or 'CC'."
+                ),
             }
         ]
 
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/reviewers", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/reviewers"
     payload = {"reviewer": reviewer, "state": state}
     args = _create_post_args(url, payload)
 
@@ -644,7 +893,11 @@ async def add_reviewer(
                 return [
                     {
                         "type": "text",
-                        "text": f"Failed to add {reviewer} as a {state} to CL {change_id}. Response: {result_data['error']}",
+                        "text": (
+                            f"Failed to add {reviewer} as a {state} "
+                            f"to CL {change_id}. "
+                            f"Response: {result_data['error']}"
+                        ),
                     }
                 ]
         except json.JSONDecodeError:
@@ -653,14 +906,19 @@ async def add_reviewer(
                 return [
                     {
                         "type": "text",
-                        "text": f"Failed to add {reviewer} as a {state} to CL {change_id}. Response: {result_str}",
+                        "text": (
+                            f"Failed to add {reviewer} as a {state} "
+                            f"to CL {change_id}. Response: {result_str}"
+                        ),
                     }
                 ]
 
         return [
             {
                 "type": "text",
-                "text": f"Successfully added {reviewer} as a {state} to CL {change_id}.",
+                "text": (
+                    f"Successfully added {reviewer} as a {state} to CL {change_id}."
+                ),
             }
         ]
     except Exception as e:
@@ -681,8 +939,10 @@ async def set_ready_for_review(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/ready", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/ready"
     args = _create_post_args(url)
 
     try:
@@ -691,14 +951,18 @@ async def set_ready_for_review(
             return [
                 {
                     "type": "text",
-                    "text": f"Failed to set CL {change_id} as ready for review. Response: {result_json}",
+                    "text": (
+                        f"Failed to set CL {change_id} as ready for review. "
+                        f"Response: {result_json}"
+                    ),
                 }
             ]
         return [{"type": "text", "text": f"CL {change_id} is now ready for review."}]
     except Exception as e:
         with _open_log_file() as log_file:
             log_file.write(
-                f"[gerrit-mcp-server] Error setting CL {change_id} as ready for review: {e}\n"
+                f"[gerrit-mcp-server] Error setting CL {change_id} "
+                f"as ready for review: {e}\n"
             )
         raise e
 
@@ -714,8 +978,10 @@ async def set_work_in_progress(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/wip", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/wip"
     payload = {"message": message} if message else None
     args = _create_post_args(url, payload)
 
@@ -725,14 +991,18 @@ async def set_work_in_progress(
             return [
                 {
                     "type": "text",
-                    "text": f"Failed to set CL {change_id} as work-in-progress. Response: {result_json}",
+                    "text": (
+                        f"Failed to set CL {change_id} as work-in-progress. "
+                        f"Response: {result_json}"
+                    ),
                 }
             ]
         return [{"type": "text", "text": f"CL {change_id} is now a work-in-progress."}]
     except Exception as e:
         with _open_log_file() as log_file:
             log_file.write(
-                f"[gerrit-mcp-server] Error setting CL {change_id} as work-in-progress: {e}\n"
+                f"[gerrit-mcp-server] Error setting CL {change_id} "
+                f"as work-in-progress: {e}\n"
             )
         raise e
 
@@ -748,8 +1018,10 @@ async def revert_change(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revert", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revert"
     payload = {"message": message} if message else None
     args = _create_post_args(url, payload)
 
@@ -794,8 +1066,10 @@ async def revert_submission(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revert_submission", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revert_submission"
     payload = {"message": message} if message else None
     args = _create_post_args(url, payload)
 
@@ -812,20 +1086,27 @@ async def revert_submission(
             return [
                 {
                     "type": "text",
-                    "text": f"Failed to revert submission for CL {change_id}. Response: {result_str}",
+                    "text": (
+                        f"Failed to revert submission for CL {change_id}. "
+                        f"Response: {result_str}"
+                    ),
                 }
             ]
     except json.JSONDecodeError:
         return [
             {
                 "type": "text",
-                "text": f"Failed to revert submission for CL {change_id}. Response: {result_str}",
+                "text": (
+                    f"Failed to revert submission for CL {change_id}. "
+                    f"Response: {result_str}"
+                ),
             }
         ]
     except Exception as e:
         with _open_log_file() as log_file:
             log_file.write(
-                f"[gerrit-mcp-server] Error reverting submission for CL {change_id}: {e}\n"
+                f"[gerrit-mcp-server] Error reverting submission "
+                f"for CL {change_id}: {e}\n"
             )
         raise e
 
@@ -844,8 +1125,10 @@ async def create_change(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, "changes/", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/"
 
     payload = {
         "project": project,
@@ -915,8 +1198,10 @@ async def set_topic(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/topic", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/topic"
 
     payload = json.dumps({"topic": topic})
     args = ["-X", "PUT", "-H", "Content-Type: application/json", "--data", payload, url]
@@ -944,29 +1229,109 @@ async def set_topic(
         # Check if the exception is a JSONDecodeError and try to get the response text
         if isinstance(e, json.JSONDecodeError):
             # The raw response is not directly available in the exception,
-            # so we have to re-run the command to get the raw output for the error message.
-            # This is not ideal, but it's the most reliable way to get the error message.
+            # so we have to re-run the command to get the raw output
+            # for the error message.
+            # This is not ideal, but it's the most reliable way
+            # to get the error message.
             try:
                 raw_response = await run_curl(args, base_url)
                 return [
                     {
                         "type": "text",
-                        "text": f"Failed to set topic for CL {change_id}. Response: {raw_response}",
+                        "text": (
+                            f"Failed to set topic for CL {change_id}. "
+                            f"Response: {raw_response}"
+                        ),
                     }
                 ]
             except Exception as inner_e:
                 return [
                     {
                         "type": "text",
-                        "text": f"An error occurred while setting the topic for CL {change_id}: {inner_e}",
+                        "text": (
+                            f"An error occurred while setting the topic "
+                            f"for CL {change_id}: {inner_e}"
+                        ),
                     }
                 ]
         return [
             {
                 "type": "text",
-                "text": f"An error occurred while setting the topic for CL {change_id}: {e}",
+                "text": (
+                    f"An error occurred while setting the topic for CL {change_id}: {e}"
+                ),
             }
         ]
+
+
+class _ParentChange(TypedDict):
+    change_number: int
+    subject: str
+    work_in_progress: bool
+
+
+class _GitParentChangesResult(TypedDict):
+    change_id: str
+    parent_changes: List[_ParentChange]
+    note: Optional[str]
+
+
+@mcp.tool()
+async def get_git_parent_changes(
+    change_id: str,
+    gerrit_base_url: Optional[str] = None,
+) -> _GitParentChangesResult:
+    """
+    Returns the immediate git-parent changes of a given CL.
+
+    Uses the parentof: query operator to find changes whose commit is a direct
+    parent of the given change's commit. Returns only immediate parents, not
+    grandparents or higher ancestors.
+
+    change_id can be a numeric change number or a Change-Id (I... hash from the
+    commit footer).
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/?q={quote(f'parentof:{change_id}')}"
+
+    try:
+        result_json_str = await run_curl([url], base_url)
+        changes = json.loads(result_json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            "Failed to parse JSON response from Gerrit."
+            f" Raw response: '{result_json_str}'"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Error fetching git-parent changes for {change_id}: {e}"
+        ) from e
+
+    parent_changes: List[_ParentChange] = [
+        {
+            "change_number": change["_number"],
+            "subject": change["subject"],
+            "work_in_progress": change.get("work_in_progress", False),
+        }
+        for change in changes
+    ]
+
+    result: _GitParentChangesResult = {
+        "change_id": change_id,
+        "parent_changes": parent_changes,
+        "note": None,
+    }
+    if not parent_changes:
+        result["note"] = (
+            "No git-parent changes found."
+            " The parent commit is not an open Gerrit change."
+        )
+
+    return result
 
 
 @mcp.tool()
@@ -980,8 +1345,10 @@ async def changes_submitted_together(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/submitted_together", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/submitted_together"
 
     if options:
         query_params = "&".join([f"o={option}" for option in options])
@@ -1015,7 +1382,10 @@ async def changes_submitted_together(
             output += f"- {change['_number']}: {change['subject']}\n"
 
         if non_visible_changes > 0:
-            output += f"Plus {non_visible_changes} other changes that are not visible to you.\n"
+            output += (
+                f"Plus {non_visible_changes} other changes that are "
+                "not visible to you.\n"
+            )
 
         return [{"type": "text", "text": output}]
 
@@ -1023,16 +1393,215 @@ async def changes_submitted_together(
         return [
             {
                 "type": "text",
-                "text": f"Failed to get submitted together info for CL {change_id}. Response: {result_str}",
+                "text": (
+                    f"Failed to get submitted together info for CL {change_id}. "
+                    f"Response: {result_str}"
+                ),
             }
         ]
     except Exception as e:
         return [
             {
                 "type": "text",
-                "text": f"An error occurred while getting submitted together info for CL {change_id}: {e}",
+                "text": (
+                    f"An error occurred while getting submitted together "
+                    f"info for CL {change_id}: {e}"
+                ),
             }
         ]
+
+
+class _RelatedChange(TypedDict):
+    change_number: Optional[int]
+    change_id: Optional[str]
+    project: Optional[str]
+    subject: Optional[str]
+    commit_sha: Optional[str]
+    parents: List[str]
+    status: Optional[str]
+    revision_number: Optional[int]
+    current_revision_number: Optional[int]
+
+
+class _RelatedChangesResult(TypedDict):
+    change_id: str
+    revision_id: str
+    related_changes: List[_RelatedChange]
+    note: Optional[str]
+
+
+@mcp.tool()
+async def get_related_changes(
+    change_id: str,
+    revision_id: Optional[str] = None,
+    gerrit_base_url: Optional[str] = None,
+) -> _RelatedChangesResult:
+    """
+    Returns the relation chain for a change: the queried change, its ancestors
+    (git parent chain), and any descendants that share the same chain.
+
+    This surfaces the same data as the "Relation chain" panel in the Gerrit Web
+    UI, letting agents diagnose implicit git-parent dependencies without chasing
+    individual parent SHAs.
+
+    Each entry in related_changes includes status (NEW/MERGED/ABANDONED) and
+    revision_number vs current_revision_number, so callers can flag unmerged or
+    stale ancestor commits.
+
+    Results are ordered newest-first: descendants of the queried change appear
+    before it; ancestors appear after it.
+
+    change_id can be a numeric change number, a Change-Id (I... hash), or a
+    project~branch~Change-Id triplet.
+
+    revision_id defaults to "current" (the latest patch set).
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    rev = revision_id or "current"
+    url = f"{base_url}/changes/{change_id}/revisions/{rev}/related"
+
+    try:
+        result_str = await run_curl([url], base_url)
+        data = json.loads(result_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Failed to parse JSON response from Gerrit for change "
+            f"{change_id}. Raw response: '{result_str}'"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Error getting related changes for {change_id}: {e}") from e
+
+    raw_entries = data.get("changes", [])
+    related: List[_RelatedChange] = []
+    for entry in raw_entries:
+        commit = entry.get("commit", {})
+        related.append(
+            {
+                "change_number": entry.get("_change_number"),
+                "change_id": entry.get("change_id"),
+                "project": entry.get("project"),
+                "subject": commit.get("subject"),
+                "commit_sha": commit.get("commit"),
+                "parents": [
+                    p["commit"] for p in commit.get("parents", []) if p.get("commit")
+                ],
+                "status": entry.get("status"),
+                "revision_number": entry.get("_revision_number"),
+                "current_revision_number": entry.get("_current_revision_number"),
+            }
+        )
+
+    result: _RelatedChangesResult = {
+        "change_id": change_id,
+        "revision_id": rev,
+        "related_changes": related,
+        "note": None,
+    }
+    if not related:
+        result["note"] = (
+            "No related changes found. This change is not part of a stacked "
+            "series, or ancestors are not visible to the current user."
+        )
+
+    return result
+
+
+class _GitPerson(TypedDict):
+    name: Optional[str]
+    email: Optional[str]
+    date: Optional[str]
+
+
+class _CommitParent(TypedDict):
+    commit_sha: Optional[str]
+    subject: Optional[str]
+
+
+class _RevisionCommit(TypedDict):
+    commit_sha: Optional[str]
+    parents: List[_CommitParent]
+    author: _GitPerson
+    committer: _GitPerson
+    subject: Optional[str]
+    message: Optional[str]
+
+
+class _RevisionCommitResult(TypedDict):
+    change_id: str
+    revision_id: str
+    commit: _RevisionCommit
+
+
+@mcp.tool()
+async def get_revision_commit(
+    change_id: str,
+    revision_id: Optional[str] = None,
+    gerrit_base_url: Optional[str] = None,
+) -> _RevisionCommitResult:
+    """
+    Returns the full commit object for a change's revision: commit SHA, parent
+    SHA(s), author, committer, subject, and the raw commit message.
+
+    Use this tool to retrieve raw per-revision commit metadata — especially the
+    parent SHA(s) — for a single revision. To check whether a parent is merged,
+    follow up with query_changes("commit:<sha>"). For full ancestor-chain
+    diagnosis, prefer get_related_changes instead.
+
+    change_id can be a numeric change number, a Change-Id (I... hash), or a
+    project~branch~Change-Id triplet.
+
+    revision_id defaults to "current" (the latest patch set). Pass a patch-set
+    number or commit SHA to target a specific revision.
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    rev = revision_id or "current"
+    url = f"{base_url}/changes/{change_id}/revisions/{rev}/commit"
+
+    try:
+        result_str = await run_curl([url], base_url)
+        data = json.loads(result_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Failed to parse JSON response from Gerrit for change "
+            f"{change_id} revision {rev}. Raw response: '{result_str}'"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Error getting revision commit for {change_id}: {e}") from e
+
+    def _map_git_person(person: dict) -> _GitPerson:
+        return {
+            "name": person.get("name"),
+            "email": person.get("email"),
+            "date": person.get("date"),
+        }
+
+    parents: List[_CommitParent] = [
+        {"commit_sha": p.get("commit"), "subject": p.get("subject")}
+        for p in data.get("parents", [])
+    ]
+
+    commit: _RevisionCommit = {
+        "commit_sha": data.get("commit"),
+        "parents": parents,
+        "author": _map_git_person(data.get("author", {})),
+        "committer": _map_git_person(data.get("committer", {})),
+        "subject": data.get("subject"),
+        "message": data.get("message"),
+    }
+
+    return {
+        "change_id": change_id,
+        "revision_id": rev,
+        "commit": commit,
+    }
 
 
 @mcp.tool()
@@ -1049,8 +1618,10 @@ async def suggest_reviewers(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/suggest_reviewers?q={quote(query)}", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/suggest_reviewers?q={quote(query)}"
 
     if limit:
         url += f"&n={limit}"
@@ -1072,7 +1643,10 @@ async def suggest_reviewers(
         for suggestion in reviewers:
             if "account" in suggestion:
                 account = suggestion["account"]
-                output += f"- Account: {account.get('name', '')} ({account.get('email', 'No email')})\n"
+                output += (
+                    f"- Account: {account.get('name', '')} "
+                    f"({account.get('email', 'No email')})\n"
+                )
             elif "group" in suggestion:
                 group = suggestion["group"]
                 output += f"- Group: {group.get('name', 'Unnamed Group')}\n"
@@ -1083,14 +1657,20 @@ async def suggest_reviewers(
         return [
             {
                 "type": "text",
-                "text": f"Failed to get reviewer suggestions for CL {change_id}. Response: {result_str}",
+                "text": (
+                    f"Failed to get reviewer suggestions for CL {change_id}. "
+                    f"Response: {result_str}"
+                ),
             }
         ]
     except Exception as e:
         return [
             {
                 "type": "text",
-                "text": f"An error occurred while suggesting reviewers for CL {change_id}: {e}",
+                "text": (
+                    f"An error occurred while suggesting reviewers "
+                    f"for CL {change_id}: {e}"
+                ),
             }
         ]
 
@@ -1106,8 +1686,10 @@ async def abandon_change(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/abandon", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/abandon"
     payload = {"message": message} if message else None
     args = _create_post_args(url, payload)
 
@@ -1143,17 +1725,17 @@ async def abandon_change(
 
 
 @mcp.tool()
-async def get_most_recent_cl(
-    user: str, gerrit_base_url: Optional[str] = None
-):
+async def get_most_recent_cl(user: str, gerrit_base_url: Optional[str] = None):
     """
     Gets the most recent CL for a user.
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
     query = f"owner:{user}"
-    url = _build_gerrit_api_url(base_url, f"changes/?q={quote(query)}&n=1", config)
+    url = f"{base_url}/changes/?q={quote(query)}&n=1"
     result_json_str = await run_curl([url], base_url)
     changes = json.loads(result_json_str)
 
@@ -1163,22 +1745,22 @@ async def get_most_recent_cl(
     change = changes[0]
     wip_prefix = "[WIP] " if change.get("work_in_progress") else ""
     output = f"Most recent CL for {user}:\n"
-    output += f"- {change["_number"]}: {wip_prefix}{change["subject"]}\n"
+    output += f"- {change['_number']}: {wip_prefix}{change['subject']}\n"
 
     return [{"type": "text", "text": output}]
 
 
 @mcp.tool()
-async def get_bugs_from_cl(
-    change_id: str, gerrit_base_url: Optional[str] = None
-):
+async def get_bugs_from_cl(change_id: str, gerrit_base_url: Optional[str] = None):
     """
     Extracts bug IDs from the commit message of a CL.
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revisions/current/commit", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revisions/current/commit"
     result_json_str = await run_curl([url], base_url)
     if not result_json_str:
         return [
@@ -1207,7 +1789,10 @@ async def get_bugs_from_cl(
     return [
         {
             "type": "text",
-            "text": f"Found bug(s): {bug_list_str}. Would you like me to get more details using the `@bugged` tool?",
+            "text": (
+                f"Found bug(s): {bug_list_str}. Would you like me to get "
+                "more details using the `@bugged` tool?"
+            ),
         }
     ]
 
@@ -1227,8 +1812,10 @@ async def post_review_comment(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revisions/current/review", config)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revisions/current/review"
 
     payload = {
         "comments": {
@@ -1243,7 +1830,7 @@ async def post_review_comment(
     }
     if labels:
         payload["labels"] = labels
-    
+
     args = _create_post_args(url, payload)
 
     try:
@@ -1253,7 +1840,10 @@ async def post_review_comment(
             return [
                 {
                     "type": "text",
-                    "text": f"Successfully posted comment to CL {change_id} on file {file_path} at line {line_number}.",
+                    "text": (
+                        f"Successfully posted comment to CL {change_id} "
+                        f"on file {file_path} at line {line_number}."
+                    ),
                 }
             ]
         else:
@@ -1285,16 +1875,21 @@ async def reply_to_comment(
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
 
-    result_json_str = await _fetch_change_comments_json(change_id, base_url, config)
+    result_json_str = await _fetch_change_comments_json(change_id, base_url)
     try:
         comments_by_file = json.loads(result_json_str)
     except json.JSONDecodeError:
         return [
             {
                 "type": "text",
-                "text": f"Failed to parse JSON response from Gerrit while validating parent comment. Raw response:\n{result_json_str}",
+                "text": (
+                    "Failed to parse JSON response from Gerrit while validating "
+                    f"parent comment. Raw response:\n{result_json_str}"
+                ),
             }
         ]
 
@@ -1303,18 +1898,24 @@ async def reply_to_comment(
         return [
             {
                 "type": "text",
-                "text": f"Failed to post reply. Comment {parent_comment_id} was not found on CL {change_id}.",
+                "text": (
+                    f"Failed to post reply. Comment {parent_comment_id} "
+                    f"was not found on CL {change_id}."
+                ),
             }
         ]
     if found_file_path != file_path:
         return [
             {
                 "type": "text",
-                "text": f"Failed to post reply. Comment {parent_comment_id} belongs to file {found_file_path}, not {file_path}.",
+                "text": (
+                    f"Failed to post reply. Comment {parent_comment_id} "
+                    f"belongs to file {found_file_path}, not {file_path}."
+                ),
             }
         ]
 
-    url = _build_gerrit_api_url(base_url, f"changes/{change_id}/revisions/current/review", config)
+    url = f"{base_url}/changes/{change_id}/revisions/current/review"
     payload = {
         "comments": {
             file_path: [
@@ -1334,7 +1935,10 @@ async def reply_to_comment(
             return [
                 {
                     "type": "text",
-                    "text": f"Successfully posted reply to comment {parent_comment_id} on CL {change_id} in file {file_path}.",
+                    "text": (
+                        f"Successfully posted reply to comment {parent_comment_id} "
+                        f"on CL {change_id} in file {file_path}."
+                    ),
                 }
             ]
         return [
@@ -1346,10 +1950,310 @@ async def reply_to_comment(
     except Exception as e:
         with _open_log_file() as log_file:
             log_file.write(
-                f"[gerrit-mcp-server] Error posting reply to comment {parent_comment_id} on CL {change_id}: {e}\n"
+                f"[gerrit-mcp-server] Error posting reply to comment "
+                f"{parent_comment_id} on CL {change_id}: {e}\n"
             )
         raise e
 
+
+@mcp.tool()
+async def post_draft_comment(
+    change_id: str,
+    file_path: str,
+    message: str,
+    line_number: Optional[int] = None,
+    unresolved: bool = True,
+    gerrit_base_url: Optional[str] = None,
+    start_line: Optional[int] = None,
+    start_character: Optional[int] = None,
+    end_line: Optional[int] = None,
+    end_character: Optional[int] = None,
+    suggestion: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+):
+    """
+    Creates a draft review comment in a CL: on a line of a file, on the whole
+    file when line_number is omitted, or on the whole patch set when file_path
+    is "/PATCHSET_LEVEL" and line_number is omitted.
+    A range needs all of start_line, start_character, end_line and
+    end_character, and puts the comment on end_line.
+    Draft comments are only visible to the author until explicitly published.
+    Use in_reply_to with a parent comment ID to create a threaded reply.
+
+    """
+    comment_range = {
+        "start_line": start_line,
+        "start_character": start_character,
+        "end_line": end_line,
+        "end_character": end_character,
+    }
+    missing_range_fields = [k for k, v in comment_range.items() if v is None]
+    if 0 < len(missing_range_fields) < len(comment_range):
+        return [
+            {
+                "type": "text",
+                "text": (
+                    "Failed to create draft comment: a range needs start_line, "
+                    "start_character, end_line and end_character; missing "
+                    f"{', '.join(missing_range_fields)}."
+                ),
+            }
+        ]
+
+    if suggestion is not None:
+        message = message + f"\n```suggestion\n{suggestion}\n```"
+
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
+
+    payload: Dict[str, Any] = {
+        "path": file_path,
+        "message": message,
+        "unresolved": unresolved,
+    }
+
+    if line_number is not None:
+        payload["line"] = line_number
+
+    if in_reply_to is not None:
+        payload["in_reply_to"] = in_reply_to
+
+    if not missing_range_fields:
+        payload["range"] = comment_range
+        # Gerrit requires line to equal end_line when a range is provided.
+        payload["line"] = end_line
+
+    args = _create_put_args(url, payload)
+    location = f"file {file_path}"
+    if "line" in payload:
+        location += f" at line {payload['line']}"
+
+    try:
+        result_str = await run_curl(args, base_url)
+        result = json.loads(result_str)
+        if "id" in result:
+            return [
+                {
+                    "type": "text",
+                    "text": f"Draft comment created on CL {change_id}, {location}.",
+                }
+            ]
+        else:
+            return [
+                {
+                    "type": "text",
+                    "text": f"Failed to create draft comment. Response: {result_str}",
+                }
+            ]
+    except Exception as e:
+        with _open_log_file() as log_file:
+            log_file.write(
+                f"[gerrit-mcp-server] Error creating draft comment "
+                f"on CL {change_id}: {e}\n"
+            )
+        raise e
+
+
+@mcp.tool()
+async def list_draft_comments(change_id: str, gerrit_base_url: Optional[str] = None):
+    """
+    Lists all draft comments on a CL.
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
+
+    result_str = await run_curl([url], base_url)
+    try:
+        drafts_by_file = json.loads(result_str)
+    except json.JSONDecodeError:
+        return [
+            {"type": "text", "text": f"Failed to parse drafts response.\n{result_str}"}
+        ]
+
+    if not drafts_by_file:
+        return [{"type": "text", "text": f"No draft comments on CL {change_id}."}]
+
+    output = f"Draft comments on CL {change_id}:\n"
+    total = 0
+    for file_path, drafts in drafts_by_file.items():
+        output += f"---\nFile: {file_path}\n"
+        for draft in drafts:
+            draft_id = draft.get("id", "?")
+            line = draft.get("line", "file")
+            message = draft.get("message", "")
+            preview = message[:120].replace("\n", " ")
+            output += f"  [{draft_id}] L{line}: {preview}\n"
+            total += 1
+
+    output += f"---\nTotal: {total} draft(s)\n"
+    return [{"type": "text", "text": output}]
+
+
+async def _delete_draft_comment(base_url: str, change_id: str, draft_id: str):
+    """Deletes a single draft comment by ID."""
+    delete_url = f"{base_url}/changes/{change_id}/revisions/current/drafts/{draft_id}"
+    await run_curl(_create_delete_args(delete_url), base_url)
+
+
+@mcp.tool()
+async def delete_draft_comment(
+    change_id: str, draft_id: str, gerrit_base_url: Optional[str] = None
+):
+    """
+    Deletes a single draft comment on a CL by its draft ID.
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+
+    try:
+        await _delete_draft_comment(base_url, change_id, draft_id)
+        return [
+            {
+                "type": "text",
+                "text": f"Deleted draft comment {draft_id} on CL {change_id}.",
+            }
+        ]
+    except Exception as e:
+        with _open_log_file() as log_file:
+            log_file.write(
+                f"[gerrit-mcp-server] Error deleting draft {draft_id} "
+                f"on CL {change_id}: {e}\n"
+            )
+        raise e
+
+
+@mcp.tool()
+async def delete_draft_comments(change_id: str, gerrit_base_url: Optional[str] = None):
+    """
+    Deletes ALL draft comments on a CL.
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+
+    # First, list all drafts
+    list_url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
+    result_str = await run_curl([list_url], base_url)
+    try:
+        drafts_by_file = json.loads(result_str)
+    except json.JSONDecodeError:
+        return [
+            {"type": "text", "text": f"Failed to parse drafts response.\n{result_str}"}
+        ]
+
+    if not drafts_by_file:
+        return [
+            {"type": "text", "text": f"No draft comments to delete on CL {change_id}."}
+        ]
+
+    deleted = 0
+    errors = []
+    for file_path, drafts in drafts_by_file.items():
+        for draft in drafts:
+            draft_id = draft.get("id")
+            if not draft_id:
+                continue
+            try:
+                await _delete_draft_comment(base_url, change_id, draft_id)
+                deleted += 1
+            except Exception as e:
+                errors.append(f"  Failed to delete {draft_id} on {file_path}: {e}")
+
+    output = f"Deleted {deleted} draft comment(s) on CL {change_id}."
+    if errors:
+        output += f"\n{len(errors)} error(s):\n" + "\n".join(errors)
+    return [{"type": "text", "text": output}]
+
+
+@mcp.tool()
+async def publish_drafts(
+    change_id: str,
+    message: Optional[str] = None,
+    labels: Optional[Dict[str, int]] = None,
+    gerrit_base_url: Optional[str] = None,
+):
+    """
+    Publishes all pending draft comments on a CL as a single review.
+    This is equivalent to clicking "Send" in the Gerrit web UI — all
+    draft comments become visible to other reviewers in one batch.
+
+    """
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+    base_url = _normalize_gerrit_url(
+        _get_gerrit_base_url(gerrit_base_url), gerrit_hosts
+    )
+    url = f"{base_url}/changes/{change_id}/revisions/current/review"
+
+    payload: Dict[str, Any] = {"drafts": "PUBLISH_ALL_REVISIONS"}
+    if message:
+        payload["message"] = message
+    if labels:
+        payload["labels"] = labels
+
+    args = _create_post_args(url, payload)
+
+    try:
+        await run_curl(args, base_url)
+        return [
+            {
+                "type": "text",
+                "text": f"Successfully published all draft comments on CL {change_id}.",
+            }
+        ]
+    except Exception as e:
+        with _open_log_file() as log_file:
+            log_file.write(
+                f"[gerrit-mcp-server] Error publishing drafts on CL {change_id}: {e}\n"
+            )
+        raise e
+
+
+def main():
+    """Entry point for uvx/pip-installed deployments. Runs in stdio transport."""
+    cli_main(["gerrit-mcp-server", "stdio"])
+
+
+def _build_extension_context() -> "ExtensionContext":
+    config = load_gerrit_config()
+    gerrit_hosts = config.get("gerrit_hosts", [])
+
+    def _normalize(url: str) -> str:
+        return _normalize_gerrit_url(url, gerrit_hosts)
+
+    def _resolve_base_url(url: Optional[str] = None) -> str:
+        # Mirror the core tools: resolve defaults/env, then normalize and
+        # apply the /a auth prefix so extensions hit the authenticated endpoint.
+        return _normalize(_get_gerrit_base_url(url))
+
+    registry = PluginRegistry(
+        run_curl=run_curl,
+        normalize_url=_normalize,
+        load_config=load_gerrit_config,
+    )
+
+    return ExtensionContext(
+        mcp=mcp,
+        get_base_url=_resolve_base_url,
+        normalize_url=_normalize,
+        run_curl=run_curl,
+        load_config=load_gerrit_config,
+        log_path=LOG_FILE_PATH,
+        plugin_registry=registry,
+    )
 
 
 def cli_main(argv: List[str]):
@@ -1357,6 +2261,12 @@ def cli_main(argv: List[str]):
     The main entry point for the command-line interface.
     This function is responsible for parsing arguments and running the server.
     """
+    # Register extension tools before the transport starts, so every tool is
+    # visible from the first request. Config errors exit cleanly here rather
+    # than mid-request; broken extensions are logged and skipped.
+    context = _exit_on_config_error(_build_extension_context)
+    ExtensionLoader(context).load()
+
     # If 'stdio' is an argument, run in stdio mode and bypass HTTP server logic.
     if "stdio" in argv:
         _configure_stdio_encoding()
@@ -1371,7 +2281,10 @@ def cli_main(argv: List[str]):
             "--port",
             type=int,
             default=6322,
-            help="Port to bind the server to. Defaults to 6322 (close to 'gerrit' in leetspeak).",
+            help=(
+                "Port to bind the server to. "
+                "Defaults to 6322 (close to 'gerrit' in leetspeak)."
+            ),
         )
         args = parser.parse_args(argv[1:])
 

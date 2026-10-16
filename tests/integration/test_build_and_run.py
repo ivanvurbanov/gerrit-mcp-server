@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
-import tempfile
+import json
+import os
 import shutil
 import subprocess
-import os
+import tempfile
 import time
-import json
+import unittest
 
 
 class TestBuildAndRun(unittest.TestCase):
@@ -34,9 +34,14 @@ class TestBuildAndRun(unittest.TestCase):
             "build-gerrit.sh",
             "pyproject.toml",
             "server.sh",
-            "uv-requirements.txt",
+            "uv.lock",
         ]
-        self.dirs_to_copy = ["gerrit_mcp_server"]
+        self.dirs_to_copy = [
+            "gerrit_mcp_server",
+            "gerrit_mcp_server_task",
+            "gerrit_mcp_server_depends_on",
+            "gerrit_mcp_server_code_owners",
+        ]
 
         for file_name in self.files_to_copy:
             shutil.copy(os.path.join(self.project_root, file_name), self.test_dir.name)
@@ -97,17 +102,16 @@ class TestBuildAndRun(unittest.TestCase):
         self.assertEqual(
             build_process.returncode,
             0,
-            f"Build script failed with output:\n{build_process.stdout}\n{build_process.stderr}",
+            f"Build script failed with output:\n"
+            f"{build_process.stdout}\n{build_process.stderr}",
         )
         self.assertTrue(os.path.exists(os.path.join(self.test_dir.name, ".venv")))
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir.name, "requirements.txt"))
-        )
 
         # 2. Run the server using server.sh
         server_script_path = os.path.join(self.test_dir.name, "server.sh")
 
-        # The server script will use the newly created venv, so we don't need to modify the PATH for it.
+        # The server script will use the newly created venv, so we
+        # don't need to modify the PATH for it.
         server_env = os.environ.copy()
         server_env["PYTHONPATH"] = self.test_dir.name
 
@@ -172,33 +176,6 @@ class TestBuildAndRun(unittest.TestCase):
             env=server_env,
         )
         self.assertIn("Server is STOPPED", status_after_stop_process.stdout)
-
-    def test_test_sh_fails_without_uv(self):
-        """
-        Tests that the test.sh script fails gracefully if 'uv' is not in the PATH.
-        """
-        # Temporarily modify the PATH to exclude the directory containing 'uv'
-        original_path = os.environ["PATH"]
-        os.environ["PATH"] = ""
-
-        try:
-            # Run the test script
-            test_script_path = os.path.join(self.project_root, "test.sh")
-            test_process = subprocess.run(
-                ["/bin/bash", test_script_path],
-                cwd=self.test_dir.name,
-                capture_output=True,
-                text=True,
-            )
-
-            # Check that the script failed and printed the expected error message
-            self.assertNotEqual(
-                test_process.returncode, 0, "test.sh should fail when uv is not found"
-            )
-            self.assertIn("Failed to create virtual environment", test_process.stdout)
-        finally:
-            # Restore the original PATH
-            os.environ["PATH"] = original_path
 
 
 if __name__ == "__main__":

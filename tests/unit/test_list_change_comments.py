@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
-from unittest.mock import patch, AsyncMock
 import asyncio
 import json
+import unittest
+from unittest.mock import AsyncMock, patch
 
 from gerrit_mcp_server import main
 
@@ -68,18 +68,21 @@ class TestListChangeComments(unittest.TestCase):
             self.assertIn("Comments for CL 11223", result[0]["text"])
             self.assertIn("File: src/main.py", result[0]["text"])
             self.assertIn(
-                "L10: [user1@example.com] (2025-07-15T10:00:00Z) - UNRESOLVED comment_id=comment-1",
+                "L10: [user1@example.com] (2025-07-15T10:00:00Z) - "
+                "UNRESOLVED id=comment-1",
                 result[0]["text"],
             )
             self.assertIn("This is a comment.", result[0]["text"])
             self.assertIn(
-                "L15: [user2@example.com] (2025-07-15T10:05:00Z) - RESOLVED comment_id=comment-2 in_reply_to=comment-1",
+                "L15: [user2@example.com] (2025-07-15T10:05:00Z) - "
+                "RESOLVED id=comment-2 in_reply_to=comment-1",
                 result[0]["text"],
             )
             self.assertIn("This is resolved.", result[0]["text"])
             self.assertIn("File: README.md", result[0]["text"])
             self.assertIn(
-                "LFile: [user1@example.com] (2025-07-15T10:10:00Z) - UNRESOLVED comment_id=comment-3",
+                "LFile: [user1@example.com] (2025-07-15T10:10:00Z) - "
+                "UNRESOLVED id=comment-3",
                 result[0]["text"],
             )
             self.assertIn("Another unresolved comment.", result[0]["text"])
@@ -114,7 +117,8 @@ class TestListChangeComments(unittest.TestCase):
             # Assert
             self.assertIn("Comments for CL 11223", result[0]["text"])
             self.assertIn(
-                "L15: [user2@example.com] (2025-07-15T10:05:00Z) - RESOLVED comment_id=comment-2",
+                "L15: [user2@example.com] (2025-07-15T10:05:00Z) - "
+                "RESOLVED id=comment-2",
                 result[0]["text"],
             )
 

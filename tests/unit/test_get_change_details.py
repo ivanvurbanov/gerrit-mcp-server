@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
-from unittest.mock import patch, AsyncMock
 import asyncio
 import json
+import unittest
+from unittest.mock import AsyncMock, patch
 
 from gerrit_mcp_server import main
 
@@ -33,7 +33,11 @@ class TestGetChangeDetails(unittest.TestCase):
                 "status": "NEW",
                 "current_revision": "abc",
                 "revisions": {
-                    "abc": {"commit": {"message": "Test commit message\n\nBug: 123"}}
+                    "abc": {
+                        "_number": 1,
+                        "ref": "refs/changes/45/12345/1",
+                        "commit": {"message": "Test commit message\n\nBug: 123"},
+                    }
                 },
                 "reviewers": {
                     "REVIEWER": [{"email": "reviewer@example.com", "_account_id": 1}]
@@ -56,6 +60,11 @@ class TestGetChangeDetails(unittest.TestCase):
             self.assertIn("Subject: Test Subject", result[0]["text"])
             self.assertIn("Owner: owner@example.com", result[0]["text"])
             self.assertIn("Status: NEW", result[0]["text"])
+            self.assertIn(
+                "Current patch set: 1 (commit abc, ref refs/changes/45/12345/1)",
+                result[0]["text"],
+            )
+            self.assertNotIn("Patch sets:", result[0]["text"])
             self.assertIn("Bugs: 123", result[0]["text"])
             self.assertIn("Reviewers:", result[0]["text"])
             self.assertIn("- reviewer@example.com (Code-Review: +2)", result[0]["text"])
@@ -63,6 +72,81 @@ class TestGetChangeDetails(unittest.TestCase):
             self.assertIn(
                 "- (Patch Set 1) [No date] (Gerrit): Uploaded patch set 1.",
                 result[0]["text"],
+            )
+
+        asyncio.run(run_test())
+
+    @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
+    def test_get_change_details_all_revisions(self, mock_run_curl):
+        """ALL_REVISIONS lists every patch set with its commit, oldest first."""
+
+        async def run_test():
+            mock_response = {
+                "_number": 12345,
+                "subject": "Test Subject",
+                "owner": {"email": "owner@example.com"},
+                "status": "NEW",
+                "current_revision": "bbb",
+                "revisions": {
+                    "bbb": {"_number": 2, "ref": "refs/changes/45/12345/2"},
+                    "aaa": {"_number": 1, "ref": "refs/changes/45/12345/1"},
+                },
+            }
+            mock_run_curl.return_value = json.dumps(mock_response)
+
+            result = await main.get_change_details("12345", options=["ALL_REVISIONS"])
+
+            text = result[0]["text"]
+            self.assertIn(
+                "Current patch set: 2 (commit bbb, ref refs/changes/45/12345/2)", text
+            )
+            self.assertIn("Patch sets:\n- 1: aaa\n- 2: bbb\n", text)
+            url = mock_run_curl.call_args[0][0][0]
+            self.assertIn("o=ALL_REVISIONS", url)
+
+        asyncio.run(run_test())
+
+    @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
+    def test_get_change_details_full_messages(self, mock_run_curl):
+        """full_messages returns every message in full, a CI bot's link included."""
+
+        async def run_test():
+            notes = [{"_revision_number": 1, "message": f"Note {n}."} for n in range(3)]
+            ci_message = {
+                "_revision_number": 1,
+                "author": {"name": "CI Bot"},
+                "date": "2026-09-22 18:17:52",
+                "message": (
+                    "Patch Set 1: Verified-1\n\nBuild Failed\n\n"
+                    "https://ci.example.com/job/check/42/ : FAILURE"
+                ),
+            }
+            mock_run_curl.return_value = json.dumps(
+                {
+                    "_number": 12345,
+                    "subject": "Test Subject",
+                    "owner": {"email": "owner@example.com"},
+                    "status": "NEW",
+                    "messages": notes + [ci_message],
+                }
+            )
+
+            short = (await main.get_change_details("12345"))[0]["text"]
+            full = (await main.get_change_details("12345", full_messages=True))[0][
+                "text"
+            ]
+
+            self.assertNotIn("Note 0.", short)
+            self.assertNotIn("https://ci.example.com/job/check/42/", short)
+            self.assertIn("Note 0.", full)
+            self.assertIn(
+                "- (Patch Set 1) [2026-09-22 18:17:52] (CI Bot):\n"
+                "    Patch Set 1: Verified-1\n"
+                "\n"
+                "    Build Failed\n"
+                "\n"
+                "    https://ci.example.com/job/check/42/ : FAILURE\n",
+                full,
             )
 
         asyncio.run(run_test())

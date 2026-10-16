@@ -1,0 +1,7 @@
+{
+  "name": "gerrit",
+  "description": "An MCP server for interacting with the Gerrit code review system.",
+  "homepage": "https://gerrit.googlesource.com/gerrit-mcp-server/+/refs/heads/master/docs/",
+  "repository": "https://gerrit.googlesource.com/gerrit-mcp-server",
+  "license": "Apache-2.0"
+}

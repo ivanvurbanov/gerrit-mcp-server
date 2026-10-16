@@ -1,0 +1,15 @@
+{
+  "name": "gerrit-mcp",
+  "description": "Gerrit MCP server as a Claude Code plugin",
+  "owner": {
+    "name": "Gerrit Code Review",
+    "email": "repo-discuss@googlegroups.com",
+    "url": "https://www.gerritcodereview.com"
+  },
+  "plugins": [
+    {
+      "name": "gerrit",
+      "source": "./"
+    }
+  ]
+}

@@ -17,27 +17,73 @@ This module handles the creation of authentication-specific curl commands for Ge
 """
 
 import os
-from typing import List, Dict, Any
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
+REDACTED = "<redacted>"
 
 
-def _get_auth_for_gob(config: Dict[str, Any]) -> List[str]:
+@dataclass(frozen=True)
+class CurlAuth:
+    """A curl command prefix together with the credentials it puts on it.
+
+    The function that builds an authenticated command is the one that knows
+    which of its arguments are credentials, so it names them here instead of
+    leaving a later caller to recognise them in a flat argument list.
+    """
+
+    argv: List[str]
+    secrets: Tuple[str, ...] = ()
+
+    @property
+    def redacted_argv(self) -> List[str]:
+        """The command prefix with every credential argument masked."""
+        secret_set = set(filter(None, self.secrets))
+        return [REDACTED if token in secret_set else token for token in self.argv]
+
+
+def _get_auth_for_gob(config: Dict[str, Any]) -> CurlAuth:
     """Returns the command for gob-curl authentication."""
-    return ["gob-curl", "-s"]
+    return CurlAuth(["gob-curl", "-s"])
 
 
-def _get_auth_for_http_basic(config: Dict[str, Any]) -> List[str]:
-    """Returns the command for HTTP basic authentication."""
+def _get_auth_for_http_basic(config: Dict[str, Any]) -> CurlAuth:
+    """Returns the command for HTTP basic authentication.
+
+    The preferred setup omits both 'username' and 'auth_token', so curl reads
+    credentials from a netrc file (keyed by host) via '--netrc', or
+    '--netrc-file <netrc_path>' when 'netrc_path' is set. This mirrors
+    'git_cookies' and avoids duplicating credentials in gerrit_config.json.
+
+    Alternatively, credentials may be supplied explicitly via 'username' and
+    'auth_token' (aliases: 'user' and 'password'), in which case curl
+    authenticates with '--user'.
+    """
     username = config.get("username") or config.get("user")
     auth_token = config.get("auth_token") or config.get("password")
+
+    if not username and not auth_token:
+        netrc_path = config.get("netrc_path")
+        if netrc_path:
+            expanded_netrc_path = os.path.expanduser(netrc_path)
+            if not os.path.exists(expanded_netrc_path):
+                raise ValueError(
+                    f"Specified 'netrc_path' does not exist: {expanded_netrc_path}"
+                )
+            return CurlAuth(["curl", "--netrc-file", expanded_netrc_path, "-L"])
+        return CurlAuth(["curl", "--netrc", "-L"])
+
     if not username or not auth_token:
         raise ValueError(
-            "For 'http_basic' authentication, both 'username' (or 'user') and "
-            "'auth_token' (or 'password') must be configured."
+            "For 'http_basic' authentication, provide both 'username' and "
+            "'auth_token' (aliases: 'user' and 'password'), or omit both to use "
+            "credentials from your netrc file."
         )
-    return ["curl", "--user", f"{username}:{auth_token}", "-L"]
+    credentials = f"{username}:{auth_token}"
+    return CurlAuth(["curl", "--user", credentials, "-L"], secrets=(credentials,))
 
 
-def _get_auth_for_gitcookies(gerrit_base_url: str, config: Dict[str, Any]) -> List[str]:
+def _get_auth_for_gitcookies(gerrit_base_url: str, config: Dict[str, Any]) -> CurlAuth:
     """
     Returns the command for gitcookies authentication, falling back to an
     unauthenticated request if the cookie is not found.
@@ -57,13 +103,26 @@ def _get_auth_for_gitcookies(gerrit_base_url: str, config: Dict[str, Any]) -> Li
         )
         with open(gitcookies_path, "r") as f:
             for line in f:
-                if domain in line:
-                    parts = line.strip().split("\t")
-                    if len(parts) == 7:
+                parts = line.strip().split("\t")
+                if len(parts) == 7:
+                    cookie_domain = parts[0]
+                    # Support exact match and wildcard (leading dot) domains.
+                    # A leading dot means the entry also matches subdomains;
+                    # without it, only an exact host match is allowed.
+                    if cookie_domain.startswith("."):
+                        normalized = cookie_domain.lstrip(".")
+                        match = domain == normalized or domain.endswith(
+                            "." + normalized
+                        )
+                    else:
+                        match = domain == cookie_domain
+                    if match:
                         last_found_cookie = f"{parts[5]}={parts[6]}"
 
         if last_found_cookie:
-            return ["curl", "-b", last_found_cookie, "-L"]
+            return CurlAuth(
+                ["curl", "-b", last_found_cookie, "-L"], secrets=(last_found_cookie,)
+            )
 
     # Fallback for when the cookie file doesn't exist or has no matching cookie.
-    return ["curl", "-s", "-L"]
+    return CurlAuth(["curl", "-s", "-L"])

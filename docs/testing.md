@@ -5,42 +5,64 @@ correctly and remains stable. We use **pytest** as our testing framework.
 
 ## Quick Start
 
-The easiest way to run the tests is to use `pytest` from the root of the project.
+Run tests from the project root (no venv activation needed):
 
-1.  **Build the Environment**:
-    Run the build script to set up the virtual environment and install
-    dependencies:
-    ```bash
-    ./build-gerrit.sh
-    ```
+```bash
+uv run pytest
+```
 
-2.  **Activate Virtual Environment**:
-    ```bash
-    source .venv/bin/activate
-    ```
+If you haven't run `./build-gerrit.sh` yet, `uv run` will set up the virtual
+environment automatically on first use.
 
-3.  **Run Tests**:
-    ```bash
-    pytest
-    ```
+## Plugin Artifact Tests
+
+The integration test `tests/integration/test_plugin_package.py` validates the
+installable Claude Code artifacts without launching Claude Code. It checks the
+plugin manifest, marketplace entry, MCP launch configuration, skill metadata,
+and the configuration hook's JSON output and exit-code behavior.
+
+Run it directly with:
+
+```bash
+uv run pytest tests/integration/test_plugin_package.py
+```
+
+The hook tests run the real `hooks/check-config.sh` script and replace only its
+external `uv` invocation with a controlled test command. This keeps the tests
+deterministic while checking the paths, environment, output, and status that the
+client observes.
+
+## Claude Code Smoke Test
+
+The automated tests do not launch a Claude Code client. For a manual plugin
+smoke test, load the repository directly:
+
+```bash
+claude --plugin-dir <path-to-gerrit-mcp-server>
+```
+
+In the new session, verify that the `gerrit` MCP tools are available and that
+`/gerrit:setup` is offered when no configuration file exists. Use a temporary or
+test configuration rather than production credentials when exercising the setup
+flow.
 
 ## Test Structure
 
 The tests are organized as follows:
 
-*   `tests/unit/`: **Fast, isolated tests.** These tests verify individual
-    functions and classes in isolation. External dependencies like `curl` and
-    file system operations are mocked to ensure speed and determinism. They are
-    the first line of defense.
-*   `tests/integration/`: **Component interaction tests.** These tests verify
-    that different parts of the application work together correctly. While they
-    still mock external network calls (to avoid flakiness), they test the flow
-    of data through the system, including configuration loading and command
-    execution logic.
-*   `tests/e2e/`: **End-to-End tests.** These tests run against a live Gerrit
-    instance. They are optional and require specific configuration. They verify
-    that the server can actually communicate with a real Gerrit server and
-    perform actions like querying changes and posting comments.
+- `tests/unit/`: **Fast, isolated tests.** These tests verify individual
+  functions and classes in isolation. External dependencies like `curl` and file
+  system operations are mocked to ensure speed and determinism. They are the
+  first line of defense.
+- `tests/integration/`: **Component interaction tests.** These tests verify that
+  different parts of the application work together correctly. While they still
+  mock external network calls (to avoid flakiness), they test the flow of data
+  through the system, including configuration loading and command execution
+  logic.
+- `tests/e2e/`: **End-to-End tests.** These tests run against a live Gerrit
+  instance. They are optional and require specific configuration. They verify
+  that the server can actually communicate with a real Gerrit server and perform
+  actions like querying changes and posting comments.
 
 ## Writing Tests
 
@@ -48,6 +70,7 @@ Tests should be simple, readable, and follow the "Arrange, Act, Assert" pattern.
 We use `pytest` fixtures for setup and dependency injection.
 
 ### Example: Unit Test
+
 ```python
 import pytest
 from unittest.mock import patch
@@ -71,6 +94,7 @@ To run E2E tests, you need a `tests/e2e/e2e_config.json` file (see
 Gerrit instance to target and what credentials to use.
 
 Run them with:
+
 ```bash
-pytest tests/e2e
+uv run pytest tests/e2e
 ```

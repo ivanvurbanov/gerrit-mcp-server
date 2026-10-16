@@ -1,9 +1,14 @@
 **/.gemini/
-.venv/
-gerrit_mcp_server.egg-info
+!/.gemini/
+/.gemini/*
+!/.gemini/settings.json
+**/*.egg-info
 __pycache__/
 server.log
 server.pid
-uv.lock
 context/
 gerrit_mcp_server/gerrit_config.json
+dist/
+build/
+/.venv/
+/.claude/settings.local.json

@@ -4,28 +4,67 @@ version = "1.0.0"
 description = "An MCP server for interacting with Gerrit via curl"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp",
+    "mcp<2",
     "uvicorn",
-    "websockets"
+    "websockets",
+    "gerrit-mcp-server-task",
+    "gerrit-mcp-server-depends-on",
+    "gerrit-mcp-server-code-owners"
 ]
 
 [project.optional-dependencies]
 dev = [
+    "mdformat",
+    "mdformat-front-matters",
+    "mdformat-gfm",
+    "mdformat-pyproject",
     "pytest",
     "pytest-asyncio",
-    "pytest-env"
+    "pytest-env",
+    "ruff"
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "--asyncio-mode=auto -v --ignore=tests/e2e"
+pythonpath = ["."]
 env = [
     "GERRIT_CONFIG_PATH=tests/test_config.json"
 ]
+
+[project.scripts]
+gerrit-mcp-server = "gerrit_mcp_server.main:main"
+gerrit-check-config = "gerrit_mcp_server.main:check_config_main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.workspace]
+members = ["gerrit_mcp_server_task", "gerrit_mcp_server_depends_on", "gerrit_mcp_server_code_owners"]
+
+[tool.uv.sources]
+gerrit-mcp-server = { workspace = true }
+gerrit-mcp-server-task = { workspace = true }
+gerrit-mcp-server-depends-on = { workspace = true }
+gerrit-mcp-server-code-owners = { workspace = true }
 
 [tool.setuptools]
 packages = ["gerrit_mcp_server"]
 
 [tool.setuptools.package-data]
 gerrit_mcp_server = ["*.json"]
+
+[tool.mdformat]
+wrap = 80
+number = true
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"

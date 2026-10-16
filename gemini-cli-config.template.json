@@ -1,13 +1,10 @@
 {
   "gerrit": {
     "server_type": "stdio",
-    "command": "%%REPO_ROOT%%/gerrit/.venv/bin/python",
-    "args": [
-      "%%REPO_ROOT%%/gerrit/gerrit_mcp_server/main.py",
-      "stdio"
-    ],
+    "command": "uv",
+    "args": ["run", "--directory", "%%REPO_ROOT%%", "gerrit-mcp-server"],
     "env": {
-      "PYTHONPATH": "%%REPO_ROOT%%/gerrit/",
+      "UV_PROJECT_ENVIRONMENT": "%%REPO_ROOT%%/.venv",
       "PYTHONIOENCODING": "utf-8"
     }
   }
