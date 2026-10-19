@@ -26,6 +26,12 @@ NC='\033[0m' # No Color
 
 echo -e "\n${YELLOW}Setting up the Python environment for the Gerrit MCP server...${NC}"
 
+# Keep installer caches local to the repo so the build does not depend on
+# user-specific cache permissions.
+export PIP_CACHE_DIR="$(pwd)/build/pip-cache"
+export UV_CACHE_DIR="$(pwd)/build/uv-cache"
+mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
+
 # Use host uv if available; otherwise install it via pip with --require-hashes.
 if ! command -v uv &>/dev/null; then
     echo "uv not found on PATH, installing via pip with hash verification..."

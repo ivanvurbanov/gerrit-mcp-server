@@ -20,9 +20,14 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 # The command to run your server.
-# IMPORTANT: This should not include redirection (>) or backgrounding (&).
-# The script handles that automatically.
-SERVER_COMMAND=".venv/bin/uvicorn gerrit_mcp_server.main:app --host 127.0.0.1 --port 6322"
+SERVER_COMMAND=(
+    "$SCRIPT_DIR/.venv/bin/uvicorn"
+    "gerrit_mcp_server.main:app"
+    "--host"
+    "127.0.0.1"
+    "--port"
+    "6322"
+)
 
 # The file to store the Process ID (PID) of the running server.
 PID_FILE="$SCRIPT_DIR/server.pid"
@@ -38,8 +43,7 @@ is_running() {
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
         # Check if a process with this PID exists.
-        # The >/dev/null 2>&1 suppresses output from the ps command.
-        if ps -p $PID > /dev/null 2>&1; then
+        if kill -0 "$PID" > /dev/null 2>&1; then
             return 0 # 0 means true (is running)
         fi
     fi
@@ -54,11 +58,16 @@ start_server() {
     fi
 
     echo "Starting server..."
-    # Use setsid to run the server in a new session, creating a new process group.
-    # This prevents the stop command from killing the script that called it (e.g., the test runner).
-    $SERVER_COMMAND > "$LOG_FILE" 2>&1 & disown
+    touch "$LOG_FILE"
 
-    # '$!' is a special variable that holds the PID of the last command run in the background.
+    # Start the server in its own session/process group so it survives the shell
+    # that launched it and can be stopped cleanly via its PGID later.
+    cd "$SCRIPT_DIR" || exit 1
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "${SERVER_COMMAND[@]}" >> "$LOG_FILE" 2>&1 &
+    else
+        nohup "${SERVER_COMMAND[@]}" >> "$LOG_FILE" 2>&1 &
+    fi
     echo $! > "$PID_FILE"
 
     # Give it a moment to ensure it started correctly.
@@ -87,15 +96,11 @@ stop_server() {
     fi
 
     PID=$(cat "$PID_FILE")
-    PGID=$(ps -o pgid= -p "$PID" | grep -o '[0-9]*')
+    echo "Stopping server with PID $PID..."
 
-    echo "Stopping server process group with PGID $PGID..."
-
-    # Kill the entire process group gracefully
-    if kill -s SIGTERM -- -$PGID; then
-        # Wait for the process group to actually terminate
+    if kill -s SIGTERM "$PID" > /dev/null 2>&1; then
         for i in {1..5}; do
-            if ! ps -p $PID > /dev/null 2>&1; then
+            if ! kill -0 "$PID" > /dev/null 2>&1; then
                 echo "Server stopped successfully."
                 rm -f "$PID_FILE"
                 exit 0
@@ -104,11 +109,11 @@ stop_server() {
         done
 
         echo "Warning: Server did not stop gracefully. Forcing shutdown (kill -9)."
-        kill -s SIGKILL -- -$PGID
+        kill -s SIGKILL "$PID" > /dev/null 2>&1
         rm -f "$PID_FILE"
         echo "Server shutdown forced."
     else
-        echo "Error: Failed to send stop signal to process group $PGID."
+        echo "Error: Failed to send stop signal to PID $PID."
         exit 1
     fi
 }

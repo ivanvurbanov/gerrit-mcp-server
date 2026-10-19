@@ -18,6 +18,10 @@ set "TEMP=%BUILD_TMP%"
 set "TMP=%BUILD_TMP%"
 
 if not exist "build" mkdir "build"
+set "PIP_CACHE_DIR=%CD%\\build\\pip-cache"
+set "UV_CACHE_DIR=%CD%\\build\\uv-cache"
+if not exist "%PIP_CACHE_DIR%" mkdir "%PIP_CACHE_DIR%"
+if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
 
 echo Creating virtual environment in %VENV_DIR%...
 rem Prefer the highest available Python >= 3.12 (py launcher if present, else python in PATH).
