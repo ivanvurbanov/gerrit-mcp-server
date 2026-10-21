@@ -33,6 +33,7 @@ class TestBuildAndRun(unittest.TestCase):
         self.files_to_copy = [
             "build-gerrit.sh",
             "pyproject.toml",
+            "requirements.txt",
             "server.sh",
             "uv.lock",
         ]
